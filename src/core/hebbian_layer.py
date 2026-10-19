@@ -44,11 +44,20 @@ class HebbianConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
 
-        # Hebbian学习参数
+        # Hebbian学习与可塑性参数
         self.lr = learning_rate
-        self.oja_beta = oja_beta  # Oja规则的抑制系数
+        self.oja_beta = oja_beta  # Oja规则抑制系数
         self.use_wta = use_wta
         self.wta_ratio = wta_ratio
+
+        # BCM (Bienenstock-Cooper-Munro) 可塑性阈值
+        self.register_buffer("bcm_threshold", torch.ones(out_channels) * 0.1)
+        self.bcm_tau = 0.95  # 滑动平均衰减率
+
+        # 皮层侧向抑制矩阵 (Cortical Lateral Inhibition)
+        self.register_buffer("lateral_inhibition_weights", 
+                             torch.eye(out_channels) * 0.0 + 
+                             (1.0 - torch.eye(out_channels)) * (0.15 / max(1, out_channels - 1)))
 
         # 初始化权重（使用Kaiming初始化）
         self.weight = nn.Parameter(
@@ -64,89 +73,106 @@ class HebbianConv2d(nn.Module):
         self.gamma = nn.Parameter(torch.ones(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播"""
-        # 保存前突触活动（用于Hebbian更新）
+        """前向传播（包含皮层侧向抑制）"""
         self.pre_activity = x
 
         # 标准卷积
         out = F.conv2d(x, self.weight, self.bias, self.stride, self.padding)
 
-        # 保存后突触活动
-        self.post_activity = out
+        # 皮层侧向抑制 (Lateral Inhibition across channels)
+        if self.use_wta and self.training:
+            # out: [B, C_out, H, W]
+            B, C, H, W = out.shape
+            out_flat = out.permute(0, 2, 3, 1).reshape(-1, C)  # [B*H*W, C]
+            # y_inhibited = ReLU(y - alpha * W_lat @ y)
+            inhibition = out_flat @ self.lateral_inhibition_weights.T
+            out_inhibited = F.relu(out_flat - 0.2 * inhibition)
+            out = out_inhibited.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
+        self.post_activity = out
         return out
 
-    def hebbian_update(self):
+    def hebbian_update(self, mode: str = "spatial_bcm"):
         """
-        Hebbian权重更新
+        生物可塑性权重更新
 
-        公式: Δw = lr * pre * post - beta * post^2 * w (Oja规则)
-
-        核心思想：
-        - 前突触和后突触同时活跃时，权重增强
-        - Oja项防止权重无限增长
+        支持两种模式：
+        1. 'spatial_bcm': 空间感受野局部滑动阈值 BCM 规则（真正的二维空间突触可塑性）
+           - 利用 F.unfold 提取局部感受野 patch
+           - 计算滑动阈值 theta_M = E[post^2]
+           - delta_w = lr * post * (post - theta_M) * pre_unfold
+        2. 'oja': Sanger/Oja 主成分分析规则
+           - delta_w = lr * (post * pre - beta * post^2 * w)
         """
         if self.pre_activity is None or self.post_activity is None:
             return
 
-        # 计算Hebbian更新量
-        # pre: [B, C_in, H, W]
-        # post: [B, C_out, H', W']
+        B, C_in, H_in, W_in = self.pre_activity.shape
+        _, C_out, H_out, W_out = self.post_activity.shape
 
-        # 为了计算权重更新，需要对空间维度求平均
-        pre_mean = self.pre_activity.mean(dim=(2, 3))  # [B, C_in]
-        post_mean = self.post_activity.mean(dim=(2, 3))  # [B, C_out]
+        with torch.no_grad():
+            # 1. 展开前突触局部感受野 patch: [B, C_in * K * K, L]
+            pre_unfold = F.unfold(
+                self.pre_activity,
+                kernel_size=self.kernel_size,
+                padding=self.padding,
+                stride=self.stride
+            )
+            L = pre_unfold.shape[-1]
 
-        # 计算外积形式的更新
-        # weight: [C_out, C_in, K, K]
+            # 2. 展平后突触活动: [B, C_out, L]
+            post_flat = self.post_activity.reshape(B, C_out, -1)
+            if post_flat.shape[-1] != L:
+                post_flat = F.interpolate(post_flat, size=L, mode="nearest")
 
-        delta_w = torch.zeros_like(self.weight)
+            if mode == "spatial_bcm":
+                # --- BCM 理论滑动阈值更新 ---
+                # 更新自适应阈值 theta_M: [C_out]
+                current_activity_sq = (post_flat ** 2).mean(dim=(0, 2))
+                self.bcm_threshold.copy_(
+                    self.bcm_tau * self.bcm_threshold + (1.0 - self.bcm_tau) * current_activity_sq
+                )
 
-        for b in range(pre_mean.shape[0]):
-            # 外积: [C_in, 1] @ [1, C_out] -> [C_in, C_out]
-            hebbian_term = torch.outer(post_mean[b], pre_mean[b])  # [C_out, C_in]
+                # BCM 调节函数 phi(y, theta) = y * (y - theta_M)
+                phi = post_flat * (post_flat - self.bcm_threshold.view(1, C_out, 1))  # [B, C_out, L]
 
-            # Oja抑制项
-            oja_term = self.oja_beta * (post_mean[b]**2).mean() * self.weight
+                # 外积关联: [C_out, C_in * K * K]
+                # delta_w_flat = (phi @ pre_unfold.transpose(1, 2)).mean(dim=0) / L
+                delta_w_flat = torch.bmm(phi, pre_unfold.transpose(1, 2)).mean(dim=0) / float(L)
+                delta_w = delta_w_flat.view(C_out, C_in, self.kernel_size, self.kernel_size)
 
-            delta_w += hebbian_term.unsqueeze(-1).unsqueeze(-1)
+                # 衰减项稳定权重
+                decay = 0.001 * self.weight.data
+                self.weight.data += self.lr * (delta_w - decay)
 
-        delta_w = delta_w / pre_mean.shape[0] - oja_term
+            else:
+                # --- Oja 规则更新 ---
+                # post_flat: [B, C_out, L], pre_unfold: [B, C_in*K*K, L]
+                delta_w_flat = torch.bmm(post_flat, pre_unfold.transpose(1, 2)).mean(dim=0) / float(L)
+                delta_w = delta_w_flat.view(C_out, C_in, self.kernel_size, self.kernel_size)
 
-        # 更新权重
-        self.weight.data += self.lr * delta_w
+                # Oja 归一化二次项
+                oja_term = self.oja_beta * (post_flat ** 2).mean() * self.weight.data
+                self.weight.data += self.lr * (delta_w - oja_term)
 
-        # 可选：竞争机制（WTA）
-        if self.use_wta:
-            self._wta竞争()
+            # 3. 突触权重范数边界约束 (防止数值溢出)
+            weight_norms = torch.norm(self.weight.data.view(C_out, -1), dim=1, keepdim=True)
+            scale = torch.clamp(weight_norms, min=1.0)
+            self.weight.data /= scale.view(C_out, 1, 1, 1)
 
     def _wta竞争(self):
-        """
-        Winner-Takes-All 竞争机制
-
-        只保留最强的连接，增强特征稀疏性
-        模拟神经科学中的侧抑制机制
-        """
+        """Winner-Takes-All 稀疏化"""
         with torch.no_grad():
-            # 计算每个输出通道的权重范数
-            weight_norm = self.weight.data.pow(2).sum(dim=(1, 2, 3))  # [C_out]
-
-            # 找出要保留的通道数
+            weight_norm = self.weight.data.pow(2).sum(dim=(1, 2, 3))
             n_keep = max(1, int(self.out_channels * self.wta_ratio))
-
-            # 确定 winners
             _, winners = torch.topk(weight_norm, n_keep)
-
-            # 抑制非 winners（乘以小于1的因子）
             mask = torch.ones_like(self.weight.data)
             for w in winners:
                 mask[w] = 0.0
-
-            # 弱化非 winners
             self.weight.data *= (1 - 0.1 * mask)
 
     def get_weight_norm(self) -> torch.Tensor:
-        """获取权重范数（用于监控）"""
+        """获取各通道权重范数"""
         return self.weight.data.pow(2).sum(dim=(1, 2, 3))
 
 
