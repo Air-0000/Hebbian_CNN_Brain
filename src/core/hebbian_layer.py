@@ -79,14 +79,15 @@ class HebbianConv2d(nn.Module):
         # 标准卷积
         out = F.conv2d(x, self.weight, self.bias, self.stride, self.padding)
 
-        # 皮层侧向抑制 (Lateral Inhibition across channels)
+        # 皮层侧向抑制 (Cortical Lateral Inhibition driven by excitatory firing)
         if self.use_wta and self.training:
             # out: [B, C_out, H, W]
             B, C, H, W = out.shape
             out_flat = out.permute(0, 2, 3, 1).reshape(-1, C)  # [B*H*W, C]
-            # y_inhibited = ReLU(y - alpha * W_lat @ y)
-            inhibition = out_flat @ self.lateral_inhibition_weights.T
-            out_inhibited = F.relu(out_flat - 0.2 * inhibition)
+            # Excitatory pyramidal firing drives GABAergic interneuron lateral inhibition
+            exc = F.relu(out_flat)
+            inhibition = exc @ self.lateral_inhibition_weights.T
+            out_inhibited = F.relu(out_flat - 0.3 * inhibition)
             out = out_inhibited.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         self.post_activity = out

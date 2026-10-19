@@ -45,12 +45,12 @@ def test_cortical_lateral_inhibition():
     x = torch.randn(2, 4, 16, 16)
     out_with_inhibition = layer(x)
 
-    # Compare with pure conv without inhibition
-    out_raw = F.conv2d(x, layer.weight, layer.bias, layer.stride, layer.padding)
+    # Compare with pure conv + relu without lateral inhibition
+    out_raw = F.relu(F.conv2d(x, layer.weight, layer.bias, layer.stride, layer.padding))
     sparsity_raw = (out_raw <= 0).float().mean().item()
     sparsity_inhibited = (out_with_inhibition <= 0).float().mean().item()
 
-    assert sparsity_inhibited >= sparsity_raw, "Lateral inhibition should increase or maintain sparsity"
+    assert sparsity_inhibited >= sparsity_raw, f"Lateral inhibition should increase sparsity (got {sparsity_inhibited} vs {sparsity_raw})"
     print(f"  [PASS] test_cortical_lateral_inhibition: raw_sparsity={sparsity_raw:.3f}, inhibited_sparsity={sparsity_inhibited:.3f}")
 
 
